@@ -156,6 +156,7 @@ test_output() {
 
 	# Test output.
 	basic_test diff -r -ui -x "$VALGRIND_LOG" "${REF_DIR}" "${OUT_DIR}"
+	#print 
 
 	cleanup_test
 }

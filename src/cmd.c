@@ -13,441 +13,454 @@
 #define READ 0
 #define WRITE 1
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+int printf(const char *format, ...);
+char *strtok_r(char *str, const char *delim, char **saveptr);
+int strcmp(const char *str1, const char *str2);
+char *strstr(const char *s1, const char *s2);
+int setenv(const char *var_name, const char *new_value, int change_flag);
+void perror(const char *str);
+void exit(int status);
+void free(void *ptr);
+
+/**
+ * Parse environment variable and set it.
+ */
+void parse_environment_variable(char *command)
+{
+	if (command == NULL)
+		return;
+
+	char *saveptr;
+	char *name = strtok_r(command, "=", &saveptr);
+	char *value = strtok_r(NULL, "=", &saveptr);
+
+	setenv(name, value, 1);
+}
 
 /**
  * Internal change-directory command.
  */
-static bool shell_cd(word_t *dir) {
-  if (dir == NULL || dir->next_word != NULL) {
-    // If no arguments or more than one argument, do nothing
-    return true;
-  }
+static bool shell_cd(word_t *dir)
+{
+	// Check if dir is null or if there are more words
+	if (dir == NULL || dir->next_word != NULL)
+		return false;
 
-  // Get the directory path
-  char *dir_path = get_word(dir);
+	// Get path from dir
+	char *path = get_word(dir);
 
-  // Change the directory
-  if (chdir(dir_path) != 0) {
-    perror("chdir");
-    free(dir_path);
-    return false;
-  }
+	// Change directory
+	if (chdir(path) != 0) {
+		perror("cd");
+		free(path);
+		return false;
+	}
 
-  free(dir_path);
-  return true;
+	free(path);
+	return true;
 }
 
 /**
  * Internal exit/quit command.
  */
-static int shell_exit(void) {
-  exit(0); // Exit with status 0 (successful termination)
+static int shell_exit(void) { exit(SHELL_EXIT); }
+
+/**
+ * Duplicate file descriptor
+ */
+static int dup_fd(int fd, int descriptor)
+{
+	if (dup2(fd, descriptor) == -1) {
+		perror("dup2");
+		close(fd);
+		return -1;
+	}
+	return 0;
 }
 
-static int redirect_output(const char *filename, int append) {
-  int flags = O_WRONLY | O_CREAT;
+/**
+ *  Redirects a file descriptor to a file
+ */
+static int redirect(const char *filename, int descriptor, int append)
+{
+	int fd;
+	// Redirect input from file
+	if (descriptor == STDIN_FILENO) {
+		fd = open(filename, O_RDONLY);
 
-  if (append) {
-    flags |= O_APPEND;
-  } else {
-    flags |= O_TRUNC;
-  }
+		if (fd == -1) {
+			perror("open");
+			return -1;
+		}
 
-  int fd = open(filename, flags, 0644);
+		dup_fd(fd, STDIN_FILENO);
+		// Redirect output to file
+	} else {
+		// Set flags for open
+		int flags = O_WRONLY | O_CREAT;
+		// Set flag for append if needed
+		if (append)
+			flags |= O_APPEND;
+		else
+			flags |= O_TRUNC;
 
-  if (fd == -1) {
-    printf("open");
-    return -1;
-  }
+		// Open file
+		fd = open(filename, flags, 0644);
 
-  if (dup2(fd, STDOUT_FILENO) == -1) {
-    close(fd);
-    return -1;
-  }
+		if (fd == -1) {
+			perror("open");
+			return -1;
+		}
 
-  close(fd);
-  return 0;
+		// Redirect output to file
+		if (descriptor & STDOUT_FILENO)
+			dup_fd(fd, STDOUT_FILENO);
+
+		// Redirect error to file
+		if (descriptor & STDERR_FILENO)
+			dup_fd(fd, STDERR_FILENO);
+	}
+	close(fd);
+	return 0;
 }
 
-static int redirect_input(const char *filename) {
-  int fd = open(filename, O_RDONLY);
-  if (fd == -1) {
-    perror("open");
-    return -1;
-  }
+/**
+ * Apply redirections from a command
+ */
+static int apply_redirections(simple_command_t *s)
+{
+	int exit_status = 0, descriptors = 0;
+	// Get input file
+	char *in = get_word(s->in);
+	// If input file is not null redirect input
+	if (in != NULL) {
+		descriptors = STDIN_FILENO;
+		exit_status = redirect(in, descriptors, 0);
+	}
+	free(in);
+	// Check if redirect failed
+	if (exit_status == -1)
+		return exit_status;
 
-  if (dup2(fd, STDIN_FILENO) == -1) {
-    perror("dup2");
-    close(fd);
-    return -1;
-  }
+	// Check if output and error are the same file
+	if (s->err != NULL && s->out != NULL && s->err == s->out) {
+		// Get output file and error file
+		char *out = get_word(s->out);
+		char *err = get_word(s->err);
 
-  close(fd);
-  return 0;
-}
-static int redirect_stderr(const char *filename, int append) {
-  int flags = O_WRONLY | O_CREAT;
-  if (append) {
-    flags |= O_APPEND;
-  } else {
-    flags |= O_TRUNC;
-  }
+		// Redirect output and error to file
+		if (out != NULL && err != NULL) {
+			descriptors = STDOUT_FILENO;
+			descriptors |= STDERR_FILENO;
+			exit_status = redirect(out, descriptors, 0);
+		}
 
-  int fd = open(filename, flags, 0644);
+		free(out);
+		free(err);
+		// Else check if output and error are different files
+	} else {
+		// Redirect error to file
+		if (s->err != NULL) {
+			// Get error file
+			char *err = get_word(s->err);
+			// Set flag for append if needed
+			int append = s->io_flags & IO_ERR_APPEND;
 
-  if (fd == -1) {
-    perror("open");
-    return -1;
-  }
+			if (err != NULL) {
+				descriptors = STDERR_FILENO;
+				exit_status = redirect(err, descriptors, append);
+			}
+			free(err);
+		}
+		// Redirect output to file
+		if (s->out != NULL) {	// Get output file
+			char *out = get_word(s->out);
+			// Set flag for append if needed
+			int append = s->io_flags & IO_OUT_APPEND;
 
-  if (dup2(fd, STDERR_FILENO) == -1) {
-    perror("dup2");
-    close(fd);
-    return -1;
-  }
-
-  close(fd);
-  return 0;
-}
-
-static int redirect_output_stderr(const char *filename) {
-  int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  if (fd == -1) {
-    perror("open");
-    return -1;
-  }
-
-  if (dup2(fd, STDOUT_FILENO) == -1) {
-    perror("dup2");
-    close(fd);
-    return -1;
-  }
-
-  if (dup2(fd, STDERR_FILENO) == -1) {
-    perror("dup2");
-    close(fd);
-    return -1;
-  }
-
-  close(fd);
-  return 0;
-}
-
-static int apply_redirections(simple_command_t *s) {
-  char *in = get_word(s->in);
-  int exit_status = 0;
-  if (in != NULL) {
-    // Redirect input from file
-    exit_status = redirect_input(in);
-  }
-  free(in);
-  if (exit_status == -1) {
-    return -1;
-  }
-
-  if (s->err != NULL && s->out != NULL && s->err == s->out) {
-    char *out = get_word(s->out);
-    char *err = get_word(s->err);
-
-    // int append = s->io_flags & IO_OUT_APPEND;
-    if (out != NULL && err != NULL) {
-      // Redirect output to file
-      // int append1 = s->io_flags & IO_OUT_APPEND;
-      // int append2 = s->io_flags & IO_ERR_APPEND;
-      int exit_status = redirect_output_stderr(out);
-    }
-
-    free(out);
-    free(err);
-  } else {
-    if (s->err != NULL) {
-      char *err = get_word(s->err);
-      int append = s->io_flags & IO_ERR_APPEND;
-      if (err != NULL) {
-        // Redirect output to file
-        exit_status = redirect_stderr(err, append);
-      }
-      free(err);
-    }
-    if (s->out != NULL) {
-      char *out = get_word(s->out);
-      int append = s->io_flags & IO_OUT_APPEND;
-      if (out != NULL) {
-
-        // Redirect output to file
-        exit_status = redirect_output(out, append);
-      }
-      free(out);
-    }
-  }
-
-  return exit_status;
+			if (out != NULL) {
+				descriptors = STDOUT_FILENO;
+				exit_status = redirect(out, descriptors, append);
+			}
+			free(out);
+		}
+	}
+	return exit_status;
 }
 
+/**
+ * Duplicate file descriptors for stdin, stdout and stderr.
+ */
 static void duplicate_file_descriptors(int *original_stdin,
-                                       int *original_stdout,
-                                       int *original_stderr) {
-  *original_stdin = dup(STDIN_FILENO);
-  *original_stdout = dup(STDOUT_FILENO);
-  *original_stderr = dup(STDERR_FILENO);
+									   int *original_stdout,
+									   int *original_stderr)
+{
+	*original_stdin = dup(STDIN_FILENO);
+	*original_stdout = dup(STDOUT_FILENO);
+	*original_stderr = dup(STDERR_FILENO);
+
+	if (*original_stdin == -1 || *original_stdout == -1 ||
+		*original_stderr == -1) {
+		perror("dup");
+		close(*original_stdin);
+		close(*original_stdout);
+		close(*original_stderr);
+	}
 }
 
+/**
+ * Restore file descriptors to their original values.
+ */
 static void restore_file_descriptors(int original_stdin, int original_stdout,
-                                     int original_stderr) {
-  dup2(original_stdin, STDIN_FILENO);
-  dup2(original_stdout, STDOUT_FILENO);
-  dup2(original_stderr, STDERR_FILENO);
+									 int original_stderr)
+{
+	dup_fd(original_stdin, STDIN_FILENO);
+	dup_fd(original_stdout, STDOUT_FILENO);
+	dup_fd(original_stderr, STDERR_FILENO);
 
-  close(original_stdin);
-  close(original_stdout);
-  close(original_stderr);
+	close(original_stdin);
+	close(original_stdout);
+	close(original_stderr);
+}
+
+/**
+ *  Free memory allocated for arguments and command
+ */
+static void free_command(char **argv, int argc, char *command)
+{
+	for (int i = 0; i < argc; i++)
+		free(argv[i]);
+	free(argv);
+	free(command);
 }
 
 /**
  * Parse a simple command (internal, environment variable assignment,
  * external command).
  */
-static int parse_simple(simple_command_t *s, int level, command_t *father) {
-  /* TODO: Sanity checks. */
+static int parse_simple(simple_command_t *s, int level, command_t *father)
+{
+	if (s == NULL)
+		return 0;
 
-  char *command = get_word(s->verb);
-  int argc = 0;
-  char **argv = get_argv(s, &argc);
+	// Get command
+	char *command = get_word(s->verb);
+	// Get arguments
+	int argc = 0;
+	char **argv = get_argv(s, &argc);
+	// Duplicate file descriptors
+	int original_stdin, original_stdout, original_stderr;
 
-  // Duplicate original file descriptors
-  int original_stdin, original_stdout, original_stderr;
-  duplicate_file_descriptors(&original_stdin, &original_stdout,
-                             &original_stderr);
-  // Apply redirections
-  // int redirections_failed = false;
-  if (apply_redirections(s) == -1) {
-    return -1;
-  }
+	duplicate_file_descriptors(&original_stdin, &original_stdout,
+							   &original_stderr);
+	// Apply redirections
+	if (apply_redirections(s) == -1) {
+		free_command(argv, argc, command);
+		return -1;
+	}
 
-  if (strcmp(command, "exit") == 0 || strcmp(command, "quit") == 0) {
-    free(command);       // Free the dynamically allocated command string
-    return shell_exit(); // Call shell_exit function
-  } else if (strcmp(command, "cd") == 0) {
-    free(command); // Free the dynamically allocated command string
-    bool ret = shell_cd(s->params);
+	// Check if command is internal
+	// Check if command is exit or quit
+	if (strcmp(command, "exit") == 0 || strcmp(command, "quit") == 0) {
+		free_command(argv, argc, command);
+		restore_file_descriptors(original_stdin, original_stdout, original_stderr);
+		return shell_exit();
+	} else if (strcmp(command, "cd") == 0) {
+		bool ret = shell_cd(s->params);
 
-    // Restore original file descriptors
-    restore_file_descriptors(original_stdin, original_stdout, original_stderr);
+		free_command(argv, argc, command);
+		restore_file_descriptors(original_stdin, original_stdout, original_stderr);
 
-    return ret ? 0 : 1;
-  }
+		return ret ? 0 : 1;
+	}
 
-  // if (env_vars != NULL) {
-  //   EnvVar *var = env_vars;
-  //   while (var != NULL) {
-  //     printf("%s=%s\n", var->name, var->value);
-  //     var = var->next;
-  //   }
-  // }
-  // Check if the command is an environment variable assignment
-  if (strstr(command, "=") != NULL) {
-    // printf("env");
-    parse_env_assignment(command);
-    return 0; // Successfully processed environment variable assignment
-  }
+	// Check if command is environment variable assignment
+	if (strstr(command, "=") != NULL) {
+		parse_environment_variable(command);
+		free_command(argv, argc, command);
+		restore_file_descriptors(original_stdin, original_stdout, original_stderr);
+		return 0;
+	}
 
-  // Expand environment variables in command
-  // printf("%s", command);
-  // char *expanded_command = expand_env_vars(ar);
-  // printf("%s", expanded_command);
+	// Check if command is external
+	// Create child process
+	pid_t pid = fork();
 
-  // expand each argument
-  // for (int i = 0; i < argc; i++) {
-  //   printf("%s", argv[i]);
-  //   argv[i] = expand_env_vars(argv[i]);
-  //   printf("%s", argv[i]);
-  // }
+	if (pid == -1) {
+		free_command(argv, argc, command);
+		restore_file_descriptors(original_stdin, original_stdout, original_stderr);
+		perror("fork");
+		return -1;
+	}
 
-  pid_t pid = fork();
-  if (pid == -1) {
-    perror("fork");
-    return -1;
-  }
+	// Execute command
+	if (pid == 0) {
+		execvp(command, argv);
+		printf("Execution failed for '%s'\n", command);
+		exit(127);
+	} else {
+		int status;
 
-  if (pid == 0) {
-    // In child process
-    int status = execvp(command, argv); // Execute the command
-    perror(command); // execvp only returns if there is an error
-                     // exit dtatus of comm
-    exit(EXIT_FAILURE);
-  } else {
-    // In parent process
-    int status;
-    waitpid(pid, &status, 0); // Wait for the child process to finish
+		// Wait for child process to finish
+		waitpid(pid, &status, 0);
+		restore_file_descriptors(original_stdin, original_stdout, original_stderr);
+		free_command(argv, argc, command);
 
-    // Restore original file descriptors
-    restore_file_descriptors(original_stdin, original_stdout, original_stderr);
-    // printf("%d", WEXITSTATUS(status));
-    // printf("%d", WEXITSTATUS(status));
-    return WEXITSTATUS(status); // Return the exit status of the child
-  }
-
-  free(command);
-  // free(expanded_command);
-  return 0; // TODO: Replace with actual exit status
+		return WEXITSTATUS(status);
+	}
+	// Free memory
+	free_command(argv, argc, command);
+	return 0;
 }
 
 /**
  * Process two commands in parallel, by creating two children.
  */
 static bool run_in_parallel(command_t *cmd1, command_t *cmd2, int level,
-                            command_t *father) {
-  /* TODO: Execute cmd1 and cmd2 simultaneously. */
+							command_t *father)
+{
+	pid_t pid1, pid2;
+	int status1, status2;
 
-  pid_t pid1, pid2;
+	// Create first child process
+	pid1 = fork();
+	if (pid1 == -1) {
+		perror("fork");
+		return false;
+	}
+	// Execute first command
+	if (pid1 == 0)
+		exit(parse_command(cmd1, level + 1, father));
 
-  // Fork first child process to run cmd1
-  pid1 = fork();
-  if (pid1 == -1) {
-    perror("fork");
-    return false;
-  }
-  if (pid1 == 0) {
-    // In the first child process
-    exit(parse_command(cmd1, level + 1, father));
-  }
+	// Create second child process
+	pid2 = fork();
+	if (pid2 == -1) {
+		perror("fork");
+		return false;
+	}
+	// Execute second command
+	if (pid2 == 0)
+		exit(parse_command(cmd2, level + 1, father));
 
-  // Fork second child process to run cmd2
-  pid2 = fork();
-  if (pid2 == -1) {
-    perror("fork");
-    return false;
-  }
-  if (pid2 == 0) {
-    // In the second child process
-    exit(parse_command(cmd2, level + 1, father));
-  }
+	// Wait for child processes to finish
+	waitpid(pid1, &status1, 0);
+	waitpid(pid2, &status2, 0);
 
-  // In the parent process, return immediately without waiting for children
-  return true;
+	return true;
 }
 
 /**
  * Run commands by creating an anonymous pipe (cmd1 | cmd2).
  */
 static bool run_on_pipe(command_t *cmd1, command_t *cmd2, int level,
-                        command_t *father) {
-  int pipefd[2];
-  pid_t pid1, pid2;
+						command_t *father)
+{
+	int pipefd[2];
+	pid_t pid1, pid2;
 
-  if (pipe(pipefd) == -1) {
-    perror("pipe");
-    return false;
-  }
+	// Create pipe
+	if (pipe(pipefd) == -1) {
+		perror("pipe");
+		return false;
+	}
+	// Create first child process
+	pid1 = fork();
+	if (pid1 == -1) {
+		perror("fork");
+		return false;
+	}
+	// Execute first command
+	if (pid1 == 0) {
+		close(pipefd[0]);
+		dup2(pipefd[1], STDOUT_FILENO);
+		close(pipefd[1]);
+		// Execute cmd1
+		exit(parse_command(cmd1, level + 1, father));
+		// Parent process
+	} else {
+		// Create second child process
+		pid2 = fork();
+		if (pid2 == -1) {
+			perror("fork");
+			return false;
+		}
+		// Execute second command
+		if (pid2 == 0) {
+			close(pipefd[1]);
+			dup2(pipefd[0], STDIN_FILENO);
+			close(pipefd[0]);
 
-  pid1 = fork();
-  if (pid1 == -1) {
-    perror("fork");
-    return false;
-  }
+			// Execute cmd2
+			exit(parse_command(cmd2, level + 1, father));
+			// Back to parent process
+		} else {
+			close(pipefd[0]);
+			close(pipefd[1]);
 
-  if (pid1 == 0) {
-    // Child process for cmd1
-    close(pipefd[0]); // Close unused read end
-    dup2(pipefd[1],
-         STDOUT_FILENO); // Redirect STDOUT to write end of the pipe
-    close(pipefd[1]);
+			int status1, status2;
 
-    // Execute cmd1
-    exit(parse_command(cmd1, level + 1, father));
-  } else {
-    // Parent process
-    pid2 = fork();
-    if (pid2 == -1) {
-      perror("fork");
-      return false;
-    }
+			// Wait for child processes to finish
+			waitpid(pid1, &status1, 0);
+			waitpid(pid2, &status2, 0);
 
-    if (pid2 == 0) {
-      // Child process for cmd2
-      close(pipefd[1]);              // Close unused write end
-      dup2(pipefd[0], STDIN_FILENO); // Redirect STDIN to read end of the pipe
-      close(pipefd[0]);
-
-      // Execute cmd2
-      exit(parse_command(cmd2, level + 1, father));
-    } else {
-      // Parent process
-      close(pipefd[0]);
-      close(pipefd[1]);
-
-      int status1, status2;
-      waitpid(pid1, &status1, 0);
-      waitpid(pid2, &status2, 0);
-      // printf("%d", WEXITSTATUS(status1));
-      // printf("%d", WEXITSTATUS(status2));
-      int exit_status = WEXITSTATUS(status2);
-      // printf("%d", exit_status);
-
-      return WEXITSTATUS(status2) ? false : true;
-    }
-  }
+			return WEXITSTATUS(status2) ? false : true;
+		}
+	}
 }
 
 /**
  * Parse and execute a command.
  */
-int parse_command(command_t *c, int level, command_t *father) {
-  /* TODO: sanity checks */
-  int exit_status = 0;
-  // printf("%d", c->op);
-  if (c->op == OP_NONE) {
-    /* TODO: Execute a simple command. */
-    exit_status = parse_simple(c->scmd, level, c);
+int parse_command(command_t *c, int level, command_t *father)
+{
+	int exit_status = 0;
 
-    return exit_status; /* TODO: Replace with actual exit code of command. */
-  }
+	// Check if command is null
+	if (c == NULL)
+		return exit_status;
 
-  switch (c->op) {
-  case OP_SEQUENTIAL:
-    /* TODO: Execute the commands one after the other. */
-    /* Execute the commands one after the other. */
-    // printf("dfdfdf");
-    exit_status = parse_command(c->cmd1, level + 1, c);
-    // Check if first command executed successfully
-    exit_status = parse_command(c->cmd2, level + 1, c);
+	// Check if command is simple, if so execute it
+	if (c->op == OP_NONE) {
+		exit_status = parse_simple(c->scmd, level, c);
+		return exit_status;
+	}
 
-    // parse_command(c->cmd2, level + 1, c);
+	// Check if command is sequential, parallel, conditional or pipe
+	switch (c->op) {
+	// Execute first command and then second command
+	case OP_SEQUENTIAL:
+		exit_status = parse_command(c->cmd1, level + 1, c);
+		exit_status = parse_command(c->cmd2, level + 1, c);
+		break;
 
-    break;
+	// Execute commands simultaneously
+	case OP_PARALLEL:
+		exit_status = run_in_parallel(c->cmd1, c->cmd2, level + 1, c) ? 0 : 1;
+		break;
 
-  case OP_PARALLEL:
-    /* TODO: Execute the commands simultaneously. */
-    exit_status = run_in_parallel(c->cmd1, c->cmd2, level + 1, c) ? 0 : 1;
-    break;
+	// Execute second command only if first command returns non zero
+	case OP_CONDITIONAL_NZERO:
+		exit_status = parse_command(c->cmd1, level + 1, c);
+		if (exit_status != 0)
+			exit_status = parse_command(c->cmd2, level + 1, c);
+		break;
 
-  case OP_CONDITIONAL_NZERO:
-    /* Execute the second command only if the first one returns non zero. */
-    exit_status = parse_command(c->cmd1, level + 1, c);
-    if (exit_status != 0) {
-      exit_status = parse_command(c->cmd2, level + 1, c);
-    }
-    break;
+	// Execute second command only if first command returns zero
+	case OP_CONDITIONAL_ZERO:
+		exit_status = parse_command(c->cmd1, level + 1, c);
+		if (exit_status == 0)
+			exit_status = parse_command(c->cmd2, level + 1, c);
+		break;
 
-  case OP_CONDITIONAL_ZERO:
-    /* Execute the second command only if the first one returns zero. */
-    exit_status = parse_command(c->cmd1, level + 1, c);
-    if (exit_status == 0) {
-      exit_status = parse_command(c->cmd2, level + 1, c);
-    }
-    break;
+	// Execute commands in a pipe
+	case OP_PIPE:
+		exit_status = run_on_pipe(c->cmd1, c->cmd2, level + 1, c) ? 0 : 1;
+		break;
 
-  case OP_PIPE:
-    exit_status = run_on_pipe(c->cmd1, c->cmd2, level + 1, c) ? 0 : 1;
-    // printf("%d", exit_status);
-    break;
+	// Default case
+	default:
+		return SHELL_EXIT;
+	}
 
-  default:
-    return SHELL_EXIT;
-  }
-
-  return exit_status;
+	return exit_status;
 }
